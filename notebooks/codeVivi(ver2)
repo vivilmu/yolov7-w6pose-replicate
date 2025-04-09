@@ -1,0 +1,404 @@
+import numpy as np
+import cv2
+import torch
+import os
+import math
+import time
+from collections import deque
+from torchvision import transforms
+from utils.datasets import letterbox
+from utils.general import non_max_suppression_kpt
+from utils.plots import output_to_keypoint, plot_skeleton_kpts
+from models.yolo import Model
+
+class FallDetector:
+    def __init__(self):
+        # Threshold parameters as defined in the paper
+        self.LENGTH_FACTOR_ALPHA = 0.5  # α in the height condition formula
+        self.VELOCITY_THRESHOLD = 1.0    # px/frame for fall speed
+        self.LEG_ANGLE_THRESHOLD = 45    # degrees for leg angles
+        self.TORSO_ANGLE_THRESHOLD = 50  # degrees for torso orientation
+        self.ASPECT_RATIO_THRESHOLD = 0.8 # width/height ratio
+        self.CONFIDENCE_THRESHOLD = 0.4  # minimum keypoint confidence
+        self.TARGET_FPS = 25
+        
+        # State tracking variables
+        self.prev_keypoints = None
+        self.velocity_buffer = deque(maxlen=3)  # tracks vertical speed
+        self.fall_buffer = deque(maxlen=2)      # confirmation buffer
+        self.prev_frame_time = None
+        self.fall_start_time = None
+        self.prev_shoulder_y = None
+
+    def calculate_euclidean_distance(self, point1, point2):
+        """Calculate Euclidean distance between two points"""
+        return math.hypot(point1[0]-point2[0], point1[1]-point2[1])
+
+    def calculate_angle(self, a, b, c):
+        """Calculate angle between three points (in degrees)"""
+        try:
+            ba = np.array([a[0]-b[0], a[1]-b[1]])
+            bc = np.array([c[0]-b[0], c[1]-b[1]])
+            cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+            return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+        except:
+            return 180  # return maximum angle if calculation fails
+
+    def calculate_torso_angle(self, shoulders, hips):
+        """
+        Calculate torso angle relative to vertical axis
+        Args:
+            shoulders: list of shoulder points [(x,y), (x,y)]
+            hips: list of hip points [(x,y), (x,y)]
+        Returns:
+            angle in degrees between torso and vertical axis
+        """
+        shoulder_center = np.mean(shoulders, axis=0)
+        hip_center = np.mean(hips, axis=0)
+        vertical_vector = np.array([0, 1])
+        torso_vector = np.array([hip_center[0]-shoulder_center[0], 
+                                hip_center[1]-shoulder_center[1]])
+        
+        if np.linalg.norm(torso_vector) < 1e-6:
+            return 90  # neutral angle if points overlap
+            
+        cosine = np.dot(torso_vector, vertical_vector) / (np.linalg.norm(torso_vector) + 1e-6)
+        return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+    def detect_fall(self, keypoints):
+        """
+        Main fall detection function implementing the paper's algorithm
+        Args:
+            keypoints: Array of 17 keypoints with (x,y,confidence)
+        Returns:
+            tuple: (is_fall, state, condition_info)
+        """
+        # Keypoint indices as defined in the paper
+        NOSE = 0
+        LEFT_SHOULDER = 5
+        RIGHT_SHOULDER = 6
+        LEFT_HIP = 11
+        RIGHT_HIP = 12
+        LEFT_KNEE = 13
+        RIGHT_KNEE = 14
+        LEFT_ANKLE = 15
+        RIGHT_ANKLE = 16
+        
+        try:
+            # Extract keypoints with confidence check
+            kp = {
+                'nose': keypoints[NOSE*3:(NOSE+1)*3],
+                'left_shoulder': keypoints[LEFT_SHOULDER*3:(LEFT_SHOULDER+1)*3],
+                'right_shoulder': keypoints[RIGHT_SHOULDER*3:(RIGHT_SHOULDER+1)*3],
+                'left_hip': keypoints[LEFT_HIP*3:(LEFT_HIP+1)*3],
+                'right_hip': keypoints[RIGHT_HIP*3:(RIGHT_HIP+1)*3],
+                'left_knee': keypoints[LEFT_KNEE*3:(LEFT_KNEE+1)*3],
+                'right_knee': keypoints[RIGHT_KNEE*3:(RIGHT_KNEE+1)*3],
+                'left_ankle': keypoints[LEFT_ANKLE*3:(LEFT_ANKLE+1)*3],
+                'right_ankle': keypoints[RIGHT_ANKLE*3:(RIGHT_ANKLE+1)*3]
+            }
+            
+            # Confidence check for all keypoints
+            if any(point[2] < self.CONFIDENCE_THRESHOLD for point in kp.values()):
+                return False, "low_confidence", []
+
+            # Get coordinates (convert to tuples for clarity)
+            ls = (kp['left_shoulder'][0], kp['left_shoulder'][1])
+            rs = (kp['right_shoulder'][0], kp['right_shoulder'][1])
+            lh = (kp['left_hip'][0], kp['left_hip'][1])
+            rh = (kp['right_hip'][0], kp['right_hip'][1])
+            lk = (kp['left_knee'][0], kp['left_knee'][1])
+            rk = (kp['right_knee'][0], kp['right_knee'][1])
+            la = (kp['left_ankle'][0], kp['left_ankle'][1])
+            ra = (kp['right_ankle'][0], kp['right_ankle'][1])
+
+            """ 1. HEIGHT CONDITION (Paper Section 3.1) """
+            # Calculate length factor (Lfactor) as Euclidean distance
+            torso_mid = ((lh[0] + rh[0])/2, (lh[1] + rh[1])/2)
+            Lfactor = self.calculate_euclidean_distance(ls, torso_mid)
+            
+            # Get vertical positions
+            max_feet_y = max(la[1], ra[1])
+            min_shoulder_y = min(ls[1], rs[1])
+            
+            # Paper's height condition: yl ≤ yFl + α·Lfactor
+            height_cond = min_shoulder_y >= (max_feet_y - self.LENGTH_FACTOR_ALPHA * Lfactor)
+            
+            """ 2. VELOCITY CONDITION (Paper Section 3.2) """
+            current_time = time.time()
+            vertical_speed = 0
+            current_min_y = min(ls[1], rs[1])
+            
+            if self.prev_shoulder_y is not None and self.prev_frame_time is not None:
+                time_elapsed = current_time - self.prev_frame_time
+                if time_elapsed > 0:
+                    vertical_speed = (current_min_y - self.prev_shoulder_y) / time_elapsed
+                    self.velocity_buffer.append(abs(vertical_speed))
+            
+            avg_speed = sum(self.velocity_buffer)/len(self.velocity_buffer) if self.velocity_buffer else 0
+            speed_cond = avg_speed >= self.VELOCITY_THRESHOLD
+            
+            """ 3. ANGLE CONDITIONS (Paper Section 3.2) """
+            left_leg_angle = self.calculate_angle(lh, lk, la)
+            right_leg_angle = self.calculate_angle(rh, rk, ra)
+            leg_angle_cond = min(left_leg_angle, right_leg_angle) < self.LEG_ANGLE_THRESHOLD
+            
+            # Torso orientation (not explicitly in paper but mentioned in text)
+            torso_angle = self.calculate_torso_angle([ls, rs], [lh, rh])
+            torso_cond = torso_angle > self.TORSO_ANGLE_THRESHOLD
+            
+            """ 4. ASPECT RATIO CONDITION (Paper Section 3.1) """
+            # Body orientation ratio: width/height
+            body_width = abs(ls[0] - rs[0])
+            head_to_feet = abs(kp['nose'][1] - max_feet_y)
+            orientation_ratio = body_width / (head_to_feet + 1e-6)
+            aspect_cond = orientation_ratio > self.ASPECT_RATIO_THRESHOLD
+            
+            """ FALL DECISION LOGIC (Paper Section 3) """
+            # Combined conditions - at least 2 must be true
+            conditions_met = sum([height_cond, speed_cond, leg_angle_cond, torso_cond, aspect_cond])
+            
+            # State determination
+            current_state = "normal"
+            conditions_info = []
+            
+            if height_cond:
+                if speed_cond:  # Rapid descent
+                    current_state = "falling"
+                    self.fall_start_time = current_time
+                    conditions_info.append(f"speed:{avg_speed:.1f}px/s")
+                elif torso_cond and self.fall_start_time and (current_time - self.fall_start_time < 1.0):
+                    current_state = "fallen"
+                    conditions_info.append("horizontal")
+            
+            if leg_angle_cond:
+                conditions_info.append(f"leg_angle:{min(left_leg_angle, right_leg_angle):.0f}°")
+            
+            if aspect_cond:
+                conditions_info.append(f"aspect:{orientation_ratio:.2f}")
+            
+            # Final decision with confirmation buffer
+            is_fall = conditions_met >= 2
+            self.fall_buffer.append(is_fall)
+            final_detection = sum(self.fall_buffer) >= 2 if len(self.fall_buffer) >= 1 else is_fall
+            
+            if final_detection:
+                current_state = "fallen"
+            
+            # Update tracking variables
+            self.prev_keypoints = kp
+            self.prev_shoulder_y = current_min_y
+            self.prev_frame_time = current_time
+            
+            # Diagnostic information
+            conditions_info.extend([
+                f"height:{'Y' if height_cond else 'N'}",
+                f"speed:{'Y' if speed_cond else 'N'}",
+                f"leg_angle:{'Y' if leg_angle_cond else 'N'}",
+                f"torso:{'Y' if torso_cond else 'N'}",
+                f"aspect:{'Y' if aspect_cond else 'N'}",
+                f"conf:{min(p[2] for p in kp.values()):.2f}"
+            ])
+            
+            return final_detection, current_state, conditions_info
+            
+        except Exception as e:
+            print(f"Detection error: {str(e)}")
+            return False, "error", [f"Error: {str(e)}"]
+
+
+def process_video(video_path, model, detector, annotation_path=None):
+    # Initialize device locally if not passed as parameter
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error opening video file {video_path}")
+        return []
+
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    skip_frames = max(1, int(round(original_fps / detector.TARGET_FPS)))
+    
+    detected_frames = []
+    frame_counter = 0
+    annotation_range = parse_annotation(annotation_path) if annotation_path else None
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_counter += 1
+        if frame_counter % skip_frames != 0:
+            continue
+
+        # Preprocess frame
+        img = letterbox(frame, 960, stride=64, auto=True)[0]
+        img_tensor = transforms.ToTensor()(img)
+        img_tensor = torch.tensor(np.array([img_tensor.numpy()]))
+        
+        if torch.cuda.is_available():
+            img_tensor = img_tensor.half().to(device)
+
+        # Inference
+        with torch.no_grad():
+            output, _ = model(img_tensor)
+            output = non_max_suppression_kpt(output, 0.25, 0.65, nc=model.yaml['nc'], nkpt=model.yaml['nkpt'], kpt_label=True)
+            output = output_to_keypoint(output)
+
+        # Process detections
+        if len(output) > 0:
+            for idx in range(output.shape[0]):
+                keypoints = output[idx, 7:].T
+                is_fall, _, _ = detector.detect_fall(keypoints)
+                if is_fall:
+                    detected_frames.append(frame_counter)
+
+    cap.release()
+    return detected_frames
+
+def parse_annotation(annotation_path):
+    try:
+        with open(annotation_path, 'r') as f:
+            lines = f.readlines()
+            if len(lines) >= 2:
+                start_frame = lines[0].strip()
+                end_frame = lines[1].strip()
+                
+                # Handle cases where annotation indicates no fall
+                if start_frame in ['0', '00'] and end_frame in ['0', '00']:
+                    return None
+                
+                return (int(start_frame), int(end_frame))
+    except Exception as e:
+        print(f"Error reading annotation: {str(e)}")
+        return None
+
+def evaluate_fall_detection(detected_frames, gt_range):
+    """
+    Evaluate fall detection results against ground truth
+    
+    Args:
+        detected_frames: List of frames where falls were detected
+        gt_range: Tuple of (start_frame, end_frame) or None if no fall
+        
+    Returns:
+        bool: True if detection matches ground truth, False otherwise
+    """
+    # Case 1: No fall in ground truth (gt_range is None)
+    if gt_range is None:
+        return len(detected_frames) == 0  # Correct if no detections
+    
+    # Case 2: Fall in ground truth (gt_range is (start, end))
+    gt_start, gt_end = gt_range
+    for frame in detected_frames:
+        if gt_start <= frame <= gt_end:
+            return True  # Correct detection
+    return False  # Missed detection
+
+def test_scenario(dataset_path, scenario_name):
+    # Initialize device and model
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    weights = torch.load('yolov7-w6-pose.pt', map_location=device, weights_only=False)
+    model = weights['model'].float().eval()
+    if torch.cuda.is_available():
+        model.half().to(device)
+    
+    detector = FallDetector()
+    metrics = {
+        'true_positives': 0,
+        'false_positives': 0,
+        'false_negatives': 0,
+        'true_negatives': 0,  # Added this metric
+        'total_videos': 0
+    }
+    
+    # Find annotation and video folders
+    scenario_path = os.path.join(dataset_path, scenario_name)
+    annotation_dir = os.path.join(scenario_path, "Annotation_files")
+    videos_dir = os.path.join(scenario_path, "Videos")
+    
+    if not os.path.exists(annotation_dir) or not os.path.exists(videos_dir):
+        print(f"Could not find required folders in {scenario_path}")
+        return
+    
+    print(f"\nTesting scenario: {scenario_name}")
+    
+    # Process each video in the scenario
+    for video_file in os.listdir(videos_dir):
+        if not video_file.lower().endswith(('.avi', '.mp4', '.mov')):
+            continue
+            
+        video_name = os.path.splitext(video_file)[0]
+        video_path = os.path.join(videos_dir, video_file)
+        annotation_file = os.path.join(annotation_dir, f"{video_name}.txt")
+        
+        if not os.path.exists(annotation_file):
+            print(f"Annotation not found for {video_file}")
+            continue
+            
+        print(f"\nProcessing video: {video_file}")
+        detected_frames = process_video(video_path, model, detector, annotation_file)
+        
+        # Parse ground truth
+        gt_range = parse_annotation(annotation_file)  # This returns None if no fall
+        
+        # Evaluate prediction
+        if gt_range is None:
+            # Case: No fall in ground truth
+            metrics['total_videos'] += 1
+            if detected_frames:
+                metrics['false_positives'] += 1
+                print("Result: WRONG (False alarm - detected fall when there was none)")
+            else:
+                metrics['true_negatives'] += 1
+                print("Result: CORRECT (No fall detected as expected)")
+        else:
+            # Case: Fall in ground truth
+            metrics['total_videos'] += 1
+            is_correct = evaluate_fall_detection(detected_frames, gt_range)  # Pass the tuple directly
+            
+            if is_correct:
+                metrics['true_positives'] += 1
+                print("Result: CORRECT (Fall detected within ground truth range)")
+            else:
+                if detected_frames:
+                    metrics['false_positives'] += 1
+                    print("Result: WRONG (Fall detected outside ground truth range)")
+                else:
+                    metrics['false_negatives'] += 1
+                    print("Result: WRONG (No fall detected)")
+        
+        print(f"Ground truth fall frames: {gt_range if gt_range is not None else 'No fall'}")
+        print(f"Detected fall frames: {detected_frames}")
+    
+    # Calculate overall metrics
+    if metrics['total_videos'] > 0:
+        TP = metrics['true_positives']
+        FP = metrics['false_positives']
+        FN = metrics['false_negatives']
+        TN = metrics['true_negatives']
+        
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        accuracy = (TP + TN) / metrics['total_videos'] if metrics['total_videos'] > 0 else 0
+        
+        print("\nOverall Results:")
+        print(f"Total Videos Processed: {metrics['total_videos']}")
+        print(f"True Positives: {TP}")
+        print(f"False Positives: {FP}")
+        print(f"False Negatives: {FN}")
+        print(f"True Negatives: {TN}")
+        print(f"Precision: {precision:.2%}")
+        print(f"Recall: {recall:.2%}")
+        print(f"F1-Score: {f1:.2%}")
+        print(f"Accuracy: {accuracy:.2%}")
+    else:
+        print("\nNo valid videos processed")
+if __name__ == "__main__":
+    # Input dataset path and scenario name
+    dataset_path = r"C:\Users\LENOVO\Documents\A Skripsi\datasets\FallDataset\Dataset"
+    scenario_name = input("Enter scenario name to test (e.g. Coffee_room_01): ").strip()
+    
+    test_scenario(dataset_path, scenario_name)
